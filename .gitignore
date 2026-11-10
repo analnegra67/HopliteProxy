@@ -1,0 +1,19 @@
+# secrets and local state
+.env
+data/
+*.db
+*.db-wal
+*.db-shm
+scripts/out/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
