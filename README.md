@@ -40,7 +40,7 @@ copy .env.example .env
 python -m app.cli gen-secrets      # вставьте MASTER_KEY и ENCRYPTION_KEYS в .env
 #    в .env также задайте HOPLITE_API_KEY=hop_… (и, если проектов несколько, HOPLITE_PROJECT_ID)
 
-# 3. запуск
+# 3. запуск (или двойной клик по start-proxy.cmd: окно с логами, закрыть окно = остановить)
 python -m app                       # http://127.0.0.1:8000, документация API: /docs
 
 # 4. выпустить ключ для клиента (Hoplite-ключ читается из .env, в историю команд не попадает)
