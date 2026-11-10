@@ -47,14 +47,54 @@ async def test_streaming_with_usage(sdk) -> None:
     assert finish == "stop" and usage is not None and usage.total_tokens > 0
 
 
-async def test_errors_map_to_sdk_exceptions(sdk, app) -> None:
-    with pytest.raises(openai.BadRequestError) as bad:
-        await sdk.chat.completions.create(
-            model="gpt-6-sol", messages=[{"role": "user", "content": "x"}],
-            tools=[{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}}],
-        )
-    assert bad.value.code == "tools_not_supported"
+READ_TOOL = {"type": "function", "function": {
+    "name": "read", "description": "Read a file",
+    "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}}, "required": ["filePath"]}}}
+CALL = '<tool_calls>\n[{"name": "read", "arguments": {"filePath": "notes.txt"}}]\n</tool_calls>'
 
+
+async def test_tool_calls_round_trip(sdk, fake) -> None:
+    from tests.fake_hoplite import Say
+
+    fake.behaviour = lambda text: [Say("It says: hello")] if "<tool_result id=" in text else [Say("Reading.\n" + CALL)]
+    messages = [{"role": "user", "content": "What is in notes.txt?"}]
+    first = await sdk.chat.completions.create(model="gpt-6-sol", messages=messages, tools=[READ_TOOL])
+    choice = first.choices[0]
+    assert choice.finish_reason == "tool_calls" and choice.message.content == "Reading."
+    call = choice.message.tool_calls[0]
+    assert call.function.name == "read" and call.function.arguments == '{"filePath": "notes.txt"}'
+
+    messages += [choice.message.model_dump(exclude_none=True),
+                 {"role": "tool", "tool_call_id": call.id, "content": "hello"}]
+    stream = await sdk.chat.completions.create(model="gpt-6-sol", messages=messages, tools=[READ_TOOL], stream=True)
+    text = "".join([c.choices[0].delta.content or "" async for c in stream if c.choices])
+    assert text == "It says: hello"
+    assert len(fake.thread_creations()) == 1  # the tool result went into the same Hoplite thread
+
+
+async def test_streamed_tool_calls_accumulate_in_the_sdk(sdk, fake) -> None:
+    from tests.fake_hoplite import Say
+
+    fake.behaviour = lambda text: [Say(CALL, chunks=5)]
+    stream = await sdk.chat.completions.create(
+        model="gpt-6-sol", messages=[{"role": "user", "content": "x"}], tools=[READ_TOOL], stream=True)
+    calls, finish, content = {}, None, ""
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        content += delta.content or ""
+        for part in delta.tool_calls or []:
+            entry = calls.setdefault(part.index, {"id": part.id, "name": "", "arguments": ""})
+            entry["name"] += part.function.name or ""
+            entry["arguments"] += part.function.arguments or ""
+        finish = chunk.choices[0].finish_reason or finish
+    assert content == "" and finish == "tool_calls"
+    assert calls[0]["name"] == "read" and calls[0]["arguments"] == '{"filePath": "notes.txt"}'
+    assert calls[0]["id"].startswith("call_")
+
+
+async def test_errors_map_to_sdk_exceptions(sdk, app) -> None:
     with pytest.raises(openai.NotFoundError) as missing:
         await sdk.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": "x"}])
     assert missing.value.code == "model_not_found"

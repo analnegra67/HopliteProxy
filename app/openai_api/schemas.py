@@ -39,8 +39,9 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: str | None = None
     user: str | None = None
     metadata: dict[str, Any] | None = None
-    # Client-side function calling cannot be supported (see app.service.prompt.check_tools).
+    # Client-side tools are served by the tool bridge (app.service.toolbridge).
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any = None
+    parallel_tool_calls: bool | None = None
     functions: list[dict[str, Any]] | None = None
     function_call: Any = None

@@ -4,7 +4,7 @@
     python scripts/smoke_openai.py [--base-url http://127.0.0.1:8000/v1] [--model hoplite-default]
 
 Checks: model list, a non-streaming answer, a streamed follow-up that must land in the same Hoplite
-thread, and that `tools` is rejected with 400.
+thread, and a client tool round trip (tool_calls -> tool result -> final answer) through the tool bridge.
 """
 
 from __future__ import annotations
@@ -70,15 +70,28 @@ def main() -> int:
     else:
         print(f"[thread]     follow-up continued thread {thread_id}")
 
-    try:
-        client.chat.completions.create(
-            model=args.model, messages=[{"role": "user", "content": "x"}],
-            tools=[{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}}],
-        )
+    tools = [{"type": "function", "function": {
+        "name": "get_weather", "description": "Current weather for a city, measured by the client.",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+    conversation = [{"role": "user", "content": "What is the weather in Kyiv right now? Use the get_weather tool."}]
+    started = time.monotonic()
+    first_tool = client.chat.completions.create(model=args.model, messages=conversation, tools=tools)
+    choice = first_tool.choices[0]
+    if choice.finish_reason != "tool_calls" or not choice.message.tool_calls:
         failures += 1
-        print("FAIL: a request with tools was accepted")
-    except openai.BadRequestError as exc:
-        print(f"[tools]      rejected as expected: {exc.code}")
+        print(f"FAIL: expected a tool call, got finish={choice.finish_reason} {choice.message.content!r}")
+    else:
+        call = choice.message.tool_calls[0]
+        print(f"[tools]      {time.monotonic() - started:.1f}s -> {call.function.name}({call.function.arguments})")
+        conversation += [choice.message.model_dump(exclude_none=True),
+                         {"role": "tool", "tool_call_id": call.id, "content": '{"temp_c": 17, "sky": "sunny"}'}]
+        started = time.monotonic()
+        answer = client.chat.completions.create(model=args.model, messages=conversation, tools=tools)
+        text = answer.choices[0].message.content or ""
+        print(f"[tools]      {time.monotonic() - started:.1f}s answer: {text!r}")
+        if "17" not in text:
+            failures += 1
+            print("FAIL: the answer does not use the tool result")
 
     print("PASS" if failures == 0 else f"{failures} check(s) failed")
     return 1 if failures else 0

@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     model_aliases: Annotated[dict[str, str], NoDecode] = Field(default_factory=dict)
     model_catalog_ttl_seconds: float = Field(default=300.0, ge=0)
     include_reasoning: bool = False
+    # bridge: client tools (opencode, ...) are offered to the agent via a text protocol and returned as
+    # OpenAI tool_calls; reject: requests with tools get 400
+    tools_mode: Literal["bridge", "reject"] = "bridge"
+    tool_result_max_chars: int = Field(default=100_000, ge=1000)
+    tool_repair_attempts: int = Field(default=2, ge=0, le=5)
     max_concurrency_per_key: int = Field(default=4, ge=1)
     conversation_ttl_days: float = Field(default=14.0, gt=0)
 

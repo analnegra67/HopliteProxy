@@ -132,7 +132,8 @@ async def test_instructions_and_history_in_new_thread(client, auth, fake) -> Non
     assert prompt.endswith("Respond to the latest message:\n\nagain")
 
 
-async def test_tools_are_rejected(client, auth, fake) -> None:
+@pytest.mark.parametrize("settings_overrides", [{"tools_mode": "reject"}])
+async def test_tools_are_rejected_in_reject_mode(client, auth, fake) -> None:
     tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
     resp = await chat(client, auth, [user("x")], tools=tools)
     assert resp.status_code == 400

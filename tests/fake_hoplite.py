@@ -223,10 +223,10 @@ class FakeHoplite:
         return JSONResponse(payload, status_code=status)
 
     def _persist(self, thread: FakeThread, run: FakeRun | None, *, role: str, kind: str, content: str,
-                 msg_id: str | None = None) -> dict[str, Any]:
+                 msg_id: str | None = None, **extra: Any) -> dict[str, Any]:
         msg = {
             "id": msg_id or self._id("msg"), "threadId": thread.id, "runId": run.id if run else None,
-            "role": role, "kind": kind, "content": content, "createdAt": _now(), "metadata": None,
+            "role": role, "kind": kind, "content": content, "createdAt": _now(), "metadata": None, **extra,
         }
         thread.messages.append(msg)
         return msg
@@ -291,8 +291,8 @@ class FakeHoplite:
                 yield from self._persisted(
                     thread, run, self._persist(thread, run, role="assistant", kind="thinking", content=step.text))
             elif isinstance(step, Tool):
-                yield from self._persisted(
-                    thread, run, self._persist(thread, run, role="tool", kind="tool", content=step.output))
+                yield from self._persisted(thread, run, self._persist(
+                    thread, run, role="tool", kind="tool", content=step.output, toolName=step.name))
             elif isinstance(step, Ask):
                 question_id = self._id("q")
                 thread.questions[question_id] = {

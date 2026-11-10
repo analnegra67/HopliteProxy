@@ -18,12 +18,13 @@ from app.errors import not_found
 from app.hoplite.client import HopliteError, to_openai_error
 from app.log import request_id_var
 from app.openai_api.schemas import ChatCompletionRequest
-from app.openai_api.sse import DONE, KEEPALIVE, chunk, completion, sse_data, usage_chunk
+from app.openai_api.sse import DONE, KEEPALIVE, chunk, completion, sse_data, tool_calls_delta, usage_chunk
 from app.service.conversation import fingerprint
 from app.service.inflight import Delta, Failed, Finished, RunHandle, Update
 from app.service.models import DEFAULT_MODEL_ID, Catalog, ResolvedModel, reasoning_for
 from app.service.prompt import check_tools, omitted_media, unsupported_fields
 from app.service.runner import RunJob
+from app.service.toolbridge import ToolMode, tool_mode
 from app.services import Services
 
 log = logging.getLogger(__name__)
@@ -90,8 +91,11 @@ def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def request_fingerprint(ctx: KeyContext, model: ResolvedModel, body: ChatCompletionRequest) -> str:
-    return fingerprint("request", ctx.key_id, ctx.project_id, model.hoplite_id or "", messages=body.messages)
+def request_fingerprint(
+    ctx: KeyContext, model: ResolvedModel, body: ChatCompletionRequest, tools: ToolMode | None
+) -> str:
+    scope = ("request", ctx.key_id, ctx.project_id, model.hoplite_id or "", tools.digest() if tools else "")
+    return fingerprint(*scope, messages=body.messages)
 
 
 @router.post("/chat/completions")
@@ -102,7 +106,9 @@ async def chat_completions(
     services: Services = Depends(get_services),
 ) -> Response:
     settings = services.settings
-    check_tools(body)
+    tools = tool_mode(body)
+    if tools is not None and settings.tools_mode == "reject":
+        check_tools(body)  # raises 400 tools_not_supported
     ignored = unsupported_fields(body)
     if ignored:
         log.info("ignoring unsupported request fields", extra={"ignored_fields": ignored})
@@ -113,7 +119,7 @@ async def chat_completions(
         log.info("request messages", extra={"messages": [m.model_dump(exclude_none=True) for m in body.messages]})
 
     model = await services.models.resolve(body.model, ctx, services.hoplite(ctx.hoplite_api_key))
-    request_fp = request_fingerprint(ctx, model, body)
+    request_fp = request_fingerprint(ctx, model, body, tools)
     idempotency_key = request.headers.get("idempotency-key")
     handle = services.registry.lookup(request_fp, is_retry=_retry_count(request) > 0, idempotency_key=idempotency_key)
     if handle is not None:
@@ -124,6 +130,7 @@ async def chat_completions(
             body.messages,
             explicit_thread_id=request.headers.get("x-hoplite-thread-id") or None,
             force_new=_truthy(request.headers.get("x-hoplite-new-thread")),
+            tools=tools,
         )
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         handle = services.registry.create(
@@ -138,11 +145,12 @@ async def chat_completions(
             plan=plan,
             completion_id=completion_id,
             request_id=request_id_var.get(),
+            tools=tools,
         )
         services.registry.start(handle, services.runner.execute(handle, job))
         log.info("chat completion accepted", extra={
             "completion_id": completion_id, "plan": plan.mode, "via": plan.reason, "thread_id": plan.thread_id,
-            "model": model.label, "stream": body.stream,
+            "model": model.label, "stream": body.stream, "client_tools": len(tools.tools) if tools else 0,
         })
 
     queue = handle.subscribe()
@@ -219,6 +227,9 @@ async def _stream(
                     yield sse_data(chunk(cid, created, model, delta, include_usage=include_usage))
                     last_write = time.monotonic()
             elif isinstance(update, Finished):
+                if update.tool_calls:
+                    yield sse_data(chunk(cid, created, model, tool_calls_delta(update.tool_calls),
+                                         include_usage=include_usage))
                 yield sse_data(chunk(cid, created, model, {}, update.finish_reason, include_usage=include_usage))
                 if include_usage:
                     yield sse_data(usage_chunk(cid, created, model, update))

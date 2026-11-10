@@ -37,6 +37,11 @@ def chunk(
     return payload
 
 
+def tool_calls_delta(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
+    """A streaming delta carrying complete tool calls (clients accumulate them by index)."""
+    return {"tool_calls": [{"index": index, **call} for index, call in enumerate(tool_calls)]}
+
+
 def usage_chunk(completion_id: str, created: int, model: str, finished: Finished) -> dict[str, Any]:
     return {
         "id": completion_id,
@@ -53,6 +58,9 @@ def completion(
     completion_id: str, created: int, model: str, finished: Finished, *, include_reasoning: bool
 ) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": finished.content, "refusal": None}
+    if finished.tool_calls:
+        message["content"] = finished.content or None
+        message["tool_calls"] = finished.tool_calls
     if include_reasoning and finished.reasoning:
         message["reasoning_content"] = finished.reasoning
     return {

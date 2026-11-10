@@ -239,3 +239,24 @@ def test_failure_classification_and_questions() -> None:
     assert answer_body(question, "Postgres") == {"answer": "Postgres"}
     double = {"request": {"questions": [{"question": "A?"}, {"question": "B?"}]}}
     assert answer_body(double, "yes") == {"answers": {"A?": "yes", "B?": "yes"}}
+
+
+def test_tool_call_parsing_is_lenient_about_shape() -> None:
+    from app.service.toolbridge import ToolMode, ToolSpec, parse_calls, split_reply, visible_prefix
+
+    mode = ToolMode((ToolSpec("edit", "", {"type": "object", "required": ["filePath", "oldString"]}),
+                     ToolSpec("read", "", {"type": "object", "required": ["filePath"]})))
+    flat = '[{"name": "edit", "filePath": "a.py", "oldString": "x", "newString": "y"}]'
+    assert parse_calls([flat], mode) == ([{"name": "edit", "arguments": {
+        "filePath": "a.py", "oldString": "x", "newString": "y"}}], None)
+    fenced = '```json\n{"name": "read", "input": {"filePath": "b"}}\n```'
+    assert parse_calls([fenced], mode)[0] == [{"name": "read", "arguments": {"filePath": "b"}}]
+    stringy = '[{"name": "read", "arguments": "{\\"filePath\\": \\"c\\"}"}]'
+    assert parse_calls([stringy], mode)[0] == [{"name": "read", "arguments": {"filePath": "c"}}]
+    assert "not valid JSON" in parse_calls(['[{"name": "read", "arguments": {"filePath": "a"}'], mode)[1]
+    assert "missing required arguments: filePath" in parse_calls(['[{"name": "read"}]'], mode)[1]
+
+    visible, blocks = split_reply('Let me look.\n<tool_calls>\n[{"name": "read"}]\n</tool_calls>\ntrailing')
+    assert visible == "Let me look.\n" and blocks == ['\n[{"name": "read"}]\n']
+    assert visible_prefix("Checking <tool_ca") == "Checking "
+    assert visible_prefix("a < b") == "a < b"

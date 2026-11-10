@@ -56,6 +56,7 @@ class Finished:
     usage: Usage
     thread_id: str
     run_id: str | None
+    tool_calls: list[dict[str, Any]] | None = None  # OpenAI tool_calls when finish_reason == "tool_calls"
 
 
 @dataclass

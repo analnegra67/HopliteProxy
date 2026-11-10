@@ -23,9 +23,11 @@ from app.errors import OpenAIError, insufficient_quota, rate_limited, upstream_e
 from app.hoplite.client import HopliteClient, HopliteError, to_openai_error
 from app.hoplite.events import CursorExpired, StreamEvent, StreamUnavailable, iter_thread_events
 from app.openai_api.schemas import ChatMessage
+from app.service import toolbridge
 from app.service.conversation import ConversationMapper, ThreadPlan
 from app.service.inflight import Delta, Failed, Finished, KeySlots, RunHandle, Started, Usage
 from app.service.models import ResolvedModel
+from app.service.toolbridge import ToolMode
 
 log = logging.getLogger(__name__)
 
@@ -121,6 +123,7 @@ class RunJob:
     plan: ThreadPlan
     completion_id: str
     request_id: str
+    tools: ToolMode | None = None  # client tools served through the tool bridge
 
 
 @dataclass
@@ -138,6 +141,10 @@ class _RunState:
     seen_messages: set[str] = field(default_factory=set)
     last_sync: float = 0.0
     warned_draft_shape: bool = False
+    bridge: bool = False  # tool bridge active: hide <tool_calls> blocks, parse them at the end
+    run_texts: list[str] = field(default_factory=list)  # raw assistant texts of the current run
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_problem: str | None = None
 
     def reset_thread(self) -> None:
         self.thread_id = self.run_id = self.user_message_id = self.cursor = None
@@ -211,7 +218,7 @@ class Runner:
     async def execute(self, handle: RunHandle, job: RunJob) -> None:
         ctx = job.ctx
         client = self.client_for(ctx.hoplite_api_key)
-        st = _RunState(model=job.model.label)
+        st = _RunState(model=job.model.label, bridge=job.tools is not None)
         if not self._slots.try_acquire(ctx.key_id, ctx.max_concurrency):
             await self._mapper.release(job.plan)
             handle.emit(Failed(rate_limited(
@@ -349,14 +356,68 @@ class Runner:
     async def _watch_until_settled(
         self, client: HopliteClient, job: RunJob, st: _RunState, handle: RunHandle
     ) -> dict[str, Any]:
-        answered = 0
+        answered = repairs = 0
         while True:
             run = await self._watch(client, st, handle)
             if (run.get("status") == "waiting" and self._settings.question_policy == "auto"
                     and answered < MAX_AUTO_ANSWERS and await self._auto_answer(client, job, st, answered)):
                 answered += 1
                 continue
+            if st.bridge and run.get("status") == "completed":
+                await self._collect(client, st, handle, run)
+                problem = await self._check_tool_calls(client, job, st)
+                if problem and repairs < self._settings.tool_repair_attempts and job.tools is not None:
+                    repairs += 1
+                    log.info("asking the agent to fix its tool call",
+                             extra={"thread_id": st.thread_id, "problem": problem, "attempt": repairs})
+                    await self._send_followup(client, job, st, toolbridge.repair_message(problem, job.tools),
+                                              label=f"repair-{repairs}")
+                    continue
+                st.tool_problem = problem
             return run
+
+    async def _check_tool_calls(self, client: HopliteClient, job: RunJob, st: _RunState) -> str | None:
+        """Parse the tool-call blocks of the current run; returns a problem description if they are invalid
+        or if the agent worked in its own sandbox instead of asking for client tools."""
+        assert job.tools is not None
+        st.tool_calls = None
+        blocks = [block for text in st.run_texts for block in toolbridge.split_reply(text)[1]]
+        if not blocks:
+            misuse = toolbridge.native_tool_misuse(await self._run_activity(client, st), job.tools)
+            if misuse:
+                return misuse
+            if job.tools.choice != "auto":
+                return "this reply had to call a client tool but contained no <tool_calls> block"
+            return None
+        calls, problem = toolbridge.parse_calls(blocks, job.tools)
+        if problem is None:
+            st.tool_calls = toolbridge.to_openai(calls)
+        return problem
+
+    async def _run_activity(self, client: HopliteClient, st: _RunState) -> list[dict[str, Any]]:
+        """Tool activity (the agent's own tool calls) recorded for the current run."""
+        if not st.thread_id or not st.run_id:
+            return []
+        try:
+            page = await client.list_messages(st.thread_id, limit=200, activity_limit=500)
+        except HopliteError as exc:
+            log.info("could not read run activity", extra={"status": exc.status})
+            return []
+        return [m for m in page.get("messages") or []
+                if isinstance(m, dict) and _str(m.get("runId")) == st.run_id and m.get("role") == "tool"]
+
+    async def _send_followup(self, client: HopliteClient, job: RunJob, st: _RunState, content: str, *,
+                             label: str) -> None:
+        """Append a proxy-authored message to the thread and switch to the run it starts."""
+        assert st.thread_id is not None
+        st.cursor = await client.event_head(thread_id=st.thread_id)
+        body: dict[str, Any] = {"content": content}
+        if job.model.hoplite_id:
+            body["model"] = job.model.hoplite_id
+        data = await client.append_message(st.thread_id, body, idempotency_key=f"{job.completion_id}:{label}")
+        st.user_message_id = _str((data.get("message") or {}).get("id"))
+        st.run_id = _str((data.get("run") or {}).get("id"))
+        st.run_texts = []
 
     async def _watch(self, client: HopliteClient, st: _RunState, handle: RunHandle) -> dict[str, Any]:
         run = await self._snapshot(client, st)
@@ -428,7 +489,8 @@ class Runner:
                     log.warning("draft frame without recognizable text",
                                 extra={"event": ev.type, "keys": sorted(ev.data)})
                 return None
-            delta = st.tracker.update(ev.message_id or "draft", ev.text)
+            text = toolbridge.visible_prefix(ev.text) if st.bridge else ev.text
+            delta = st.tracker.update(ev.message_id or "draft", text)
             if delta:
                 handle.emit(Delta(content=delta))
             return None
@@ -497,6 +559,9 @@ class Runner:
                     st.reasoning.append(piece)
                     handle.emit(Delta(reasoning=piece))
                 continue
+            if st.bridge:
+                st.run_texts.append(text)
+                text = toolbridge.split_reply(text)[0]
             delta = st.tracker.finalize(msg_id, text)
             if delta:
                 handle.emit(Delta(content=delta))
@@ -553,16 +618,16 @@ class Runner:
     ) -> Finished:
         assert st.thread_id is not None
         status = str(run.get("status"))
-        await self._sync_messages(client, st, handle, force=True)
-        if not st.tracker.sent:
-            final = run.get("assistantMessage")
-            if isinstance(final, dict) and (final.get("kind") or "chat") == "chat" and final.get("content"):
-                delta = st.tracker.finalize(str(final.get("id") or "final"), str(final["content"]))
-                if delta:
-                    handle.emit(Delta(content=delta))
+        await self._collect(client, st, handle, run)
 
         finish_reason = "stop"
         pending_question: str | None = None
+        tool_calls = st.tool_calls if st.bridge and status == "completed" else None
+        if tool_calls:
+            finish_reason = "tool_calls"
+        elif st.bridge and status == "completed" and st.tool_problem:
+            note = f"_(The agent tried to call a client tool, but the call was invalid: {st.tool_problem}.)_"
+            handle.emit(Delta(content=st.tracker.append_note(note)))
         if status == "waiting":
             note, pending_question = await self._waiting_note(client, st)
             handle.emit(Delta(content=st.tracker.append_note(note)))
@@ -583,17 +648,39 @@ class Runner:
                 raise error
 
         usage = await self._usage_delta(client, st)
-        content = st.tracker.sent
+        content = st.tracker.sent.rstrip() if tool_calls else st.tracker.sent
         try:
             await self._mapper.remember(job.ctx, job.messages, content, thread_id=st.thread_id,
-                                        run_id=st.run_id, pending_question_id=pending_question)
+                                        run_id=st.run_id, pending_question_id=pending_question,
+                                        tools=job.tools, tool_calls=tool_calls)
         except Exception:
             log.exception("failed to store the conversation fingerprint")
         log.info("chat completion finished", extra={
             "thread_id": st.thread_id, "run_id": st.run_id, "status": status, "finish_reason": finish_reason,
             "chars": len(content), "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens,
+            "tool_calls": [c["function"]["name"] for c in tool_calls] if tool_calls else None,
         })
-        return Finished(finish_reason, content, "".join(st.reasoning), usage, st.thread_id, st.run_id)
+        return Finished(finish_reason, content, "".join(st.reasoning), usage, st.thread_id, st.run_id,
+                        tool_calls=tool_calls)
+
+    async def _collect(self, client: HopliteClient, st: _RunState, handle: RunHandle, run: dict[str, Any]) -> None:
+        """Make sure every persisted assistant message of the run has been streamed (and, for the tool bridge,
+        recorded raw for parsing). Falls back to run-state's assistantMessage when the list has nothing."""
+        await self._sync_messages(client, st, handle, force=True)
+        final = run.get("assistantMessage")
+        if not isinstance(final, dict) or (final.get("kind") or "chat") != "chat" or not final.get("content"):
+            return
+        raw = str(final["content"])
+        if st.bridge:
+            if st.run_texts:
+                return
+            st.run_texts.append(raw)
+            raw = toolbridge.split_reply(raw)[0]
+        elif st.tracker.sent:
+            return
+        delta = st.tracker.finalize(str(final.get("id") or "final"), raw)
+        if delta:
+            handle.emit(Delta(content=delta))
 
     async def _waiting_note(self, client: HopliteClient, st: _RunState) -> tuple[str, str | None]:
         assert st.thread_id is not None
